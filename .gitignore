@@ -1,0 +1,8 @@
+.DS_Store
+.env
+.env.*
+*.local.json
+*.local.html
+private/
+artifacts/
+node_modules/
