@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OA 最近三天补卡提醒
 // @namespace    https://github.com/yzbf-lin/oa-attendance-reminder
-// @version      1.3.0
+// @version      1.4.0
 // @homepageURL  https://github.com/yzbf-lin/oa-attendance-reminder
 // @updateURL    https://raw.githubusercontent.com/yzbf-lin/oa-attendance-reminder/main/oa-attendance-reminder.meta.js
 // @downloadURL  https://raw.githubusercontent.com/yzbf-lin/oa-attendance-reminder/main/oa-attendance-reminder.user.js
@@ -23,7 +23,7 @@
 ;(function oaAttendanceReminder() {
   'use strict';
 
-  const SCRIPT_VERSION = '1.3.0';
+  const SCRIPT_VERSION = '1.4.0';
   // 站点适配只从本机 GM 存储加载，公开源码不携带实际部署地址。
   let settings = null;
   let settingsError = '';
@@ -298,29 +298,173 @@
     return node;
   }
 
+  function setupWidget(view) {
+    const stored = get('widgetPosition');
+    const fraction = (value) => Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : 1;
+    let position = { x: fraction(stored?.x), y: fraction(stored?.y) };
+    let drag = null;
+    let suppressClick = false;
+    const size = 56;
+    const bounds = () => {
+      const axis = (length) => {
+        const end = Math.max(0, length - size);
+        const min = Math.min(20, end / 2);
+        return { min, max: end - min, span: end - 2 * min };
+      };
+      return { x: axis(window.innerWidth), y: axis(window.innerHeight) };
+    };
+    const pixels = () => {
+      const area = bounds();
+      return { x: area.x.min + position.x * area.x.span, y: area.y.min + position.y * area.y.span };
+    };
+    const layout = () => {
+      const point = pixels();
+      view.panel.style.left = `${point.x}px`;
+      view.panel.style.top = `${point.y}px`;
+      const width = Math.max(0, Math.min(288, window.innerWidth - 24));
+      const left = Math.max(12, Math.min(point.x + size - width, window.innerWidth - width - 12));
+      const above = Math.max(0, point.y - 24);
+      const below = Math.max(0, window.innerHeight - point.y - size - 24);
+      const side = above >= 230 || above >= below ? 'above' : 'below';
+      view.panel.setAttribute('data-side', side);
+      view.popover.style.width = `${width}px`;
+      view.popover.style.left = `${left - point.x}px`;
+      view.card.style.maxHeight = `${side === 'above' ? above : below}px`;
+    };
+    const moveTo = (x, y) => {
+      const area = bounds();
+      position = {
+        x: area.x.span ? fraction((x - area.x.min) / area.x.span) : 1,
+        y: area.y.span ? fraction((y - area.y.min) / area.y.span) : 1,
+      };
+      layout();
+    };
+    const finish = (event, cancelled = false) => {
+      if (!drag || event.pointerId !== drag.pointerId) return;
+      const previous = drag;
+      drag = null;
+      if (previous.moved) {
+        suppressClick = true;
+        if (cancelled) { position = previous.position; layout(); }
+        else set('widgetPosition', { ...position });
+      }
+      view.panel.setAttribute('data-dragging', 'false');
+      if (view.orb.hasPointerCapture?.(event.pointerId)) view.orb.releasePointerCapture(event.pointerId);
+    };
+    view.orb.addEventListener('pointerdown', (event) => {
+      if (event.button !== 0 || event.isPrimary === false) return;
+      suppressClick = false;
+      drag = { pointerId: event.pointerId, x: event.clientX, y: event.clientY,
+        point: pixels(), position: { ...position }, moved: false };
+      view.orb.setPointerCapture(event.pointerId);
+      event.stopPropagation();
+    });
+    view.orb.addEventListener('pointermove', (event) => {
+      if (!drag || event.pointerId !== drag.pointerId) return;
+      const dx = event.clientX - drag.x;
+      const dy = event.clientY - drag.y;
+      if (!drag.moved && Math.hypot(dx, dy) < 6) return;
+      drag.moved = true;
+      view.panel.setAttribute('data-dragging', 'true');
+      event.preventDefault();
+      moveTo(drag.point.x + dx, drag.point.y + dy);
+    });
+    view.orb.addEventListener('pointerup', (event) => finish(event));
+    view.orb.addEventListener('pointercancel', (event) => finish(event, true));
+    view.orb.addEventListener('lostpointercapture', (event) => finish(event, true));
+    view.orb.addEventListener('click', (event) => {
+      event.stopPropagation();
+      if (suppressClick && event.detail !== 0) { suppressClick = false; event.preventDefault(); return; }
+      suppressClick = false;
+      if (!view.check.disabled && !view.check.hidden) requestCheck();
+    });
+    view.orb.addEventListener('keydown', (event) => {
+      const direction = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] }[event.key];
+      if (!event.altKey || !direction) return;
+      event.preventDefault();
+      event.stopPropagation();
+      const point = pixels();
+      const step = event.shiftKey ? 40 : 10;
+      moveTo(point.x + direction[0] * step, point.y + direction[1] * step);
+      set('widgetPosition', { ...position });
+    });
+    view.panel.addEventListener('pointerenter', () => view.panel.setAttribute('data-dismissed', 'false'));
+    view.panel.addEventListener('focusin', () => view.panel.setAttribute('data-dismissed', 'false'));
+    view.panel.addEventListener('keydown', (event) => {
+      if (event.key !== 'Escape') return;
+      event.preventDefault();
+      event.stopPropagation();
+      view.orb.focus({ preventScroll: true });
+      view.panel.setAttribute('data-dismissed', 'true');
+    });
+    view.reset.addEventListener('click', () => {
+      position = { x: 1, y: 1 };
+      del('widgetPosition');
+      layout();
+      view.orb.focus({ preventScroll: true });
+    });
+    window.addEventListener('resize', () => {
+      if (drag) finish({ pointerId: drag.pointerId }, true);
+      layout();
+    });
+    view.place = layout;
+    layout();
+  }
+
   function createUI() {
     if (ui) return ui;
     const host = element('div', undefined, document.body);
     host.id = 'oa-local-attendance-reminder';
     host.setAttribute('data-version', SCRIPT_VERSION);
-    // Shadow DOM 隔离宿主网页样式，所有业务文本只用 textContent。
+    // 样式和事件限定在自己的 Shadow DOM；位置只存本机，不记录宿主页面信息。
     const root = host.attachShadow({ mode: 'open' });
     element('style', `
-      :host { all: initial; font: 14px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; color:#243047; }
+      :host { all:initial; font:14px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; color:#20304b; }
       * { box-sizing:border-box; } button,a { font:inherit; }
       [hidden] { display:none !important; }
-      .panel { position:fixed; right:20px; bottom:20px; z-index:2147483000; width:286px;
-        padding:14px 16px; border:1px solid #cfd9e5; border-radius:12px; background:#fff;
-        box-shadow:0 8px 30px #17243c20; }
-      .panel.launcher { width:auto; max-width:calc(100vw - 40px); padding:0; border:0; background:transparent; }
-      .launcher button { padding:10px 16px; border-radius:24px; background:#2459aa; border-color:#2459aa; color:#fff; }
-      .launcher button:hover { background:#1b4584; }
-      strong { display:block; font-size:15px; } p { margin:8px 0; }
-      .status { font-size:12px; color:#526279; white-space:pre-line; overflow-wrap:anywhere; }
-      button,a { cursor:pointer; border:1px solid #c9d3e1; border-radius:7px; background:#fff;
-        color:#244666; padding:6px 12px; text-decoration:none; display:inline-block; }
-      button:hover,a:hover { background:#eff5fc; } button:disabled { opacity:.5; cursor:wait; }
-      button:focus-visible,a:focus-visible { outline:3px solid #7bb7ff; outline-offset:2px; }
+      .panel { position:fixed; width:56px; height:56px; z-index:2147483000; }
+      .orb { position:relative; width:56px; height:56px; padding:0; border-radius:50%;
+        display:grid; place-items:center; border:1px solid rgba(255,255,255,.88); color:#244e83;
+        background:linear-gradient(145deg,rgba(255,255,255,.91),rgba(226,237,250,.66));
+        -webkit-backdrop-filter:blur(18px) saturate(160%); backdrop-filter:blur(18px) saturate(160%);
+        box-shadow:inset 0 1px 1px #fff,0 6px 22px #14365b24,0 1px 3px #14365b14;
+        font-size:16px; font-weight:750; letter-spacing:-.7px; cursor:grab;
+        touch-action:none; user-select:none; -webkit-user-select:none; transition:box-shadow 160ms,background 160ms; }
+      .orb::after { content:""; position:absolute; bottom:9px; right:9px; width:7px; height:7px;
+        border-radius:50%; background:#5f80ac; border:1.5px solid rgba(255,255,255,.95); }
+      .orb[data-state="done"]::after { background:#23805d; }
+      .orb[data-state="setup"]::after { background:#a96a1d; }
+      .orb[aria-busy="true"]::after { background:#366ae3; animation:oa-breathe 1.2s ease-in-out infinite; }
+      .orb:hover { box-shadow:inset 0 1px 1px #fff,0 8px 28px #14365b32,0 0 0 3px #9ac1ee1c; }
+      .orb[aria-disabled="true"] { cursor:grab; }
+      .panel[data-dragging="true"] .orb { cursor:grabbing; box-shadow:inset 0 1px 1px #fff,0 10px 30px #14365b38,0 0 0 3px #6d9ddd30; }
+      .popover { position:absolute; bottom:calc(100% + 12px); opacity:0; visibility:hidden; pointer-events:none;
+        transform:translateY(5px); transition:opacity 160ms,transform 160ms,visibility 160ms; }
+      .popover::after { content:""; position:absolute; top:100%; left:0; right:0; height:14px; }
+      .panel[data-side="below"] .popover { bottom:auto; top:calc(100% + 12px); transform:translateY(-5px); }
+      .panel[data-side="below"] .popover::after { top:auto; bottom:100%; }
+      .panel:not([data-dismissed="true"]):hover .popover,
+      .panel:not([data-dismissed="true"]):focus-within .popover { opacity:1; visibility:visible; pointer-events:auto; transform:translateY(0); }
+      .panel[data-dragging="true"] .popover { opacity:0 !important; visibility:hidden !important; pointer-events:none !important; }
+      .card { overflow:auto; padding:18px; border:1px solid rgba(255,255,255,.88); border-radius:18px;
+        background:rgba(249,252,255,.94); -webkit-backdrop-filter:blur(24px) saturate(150%);
+        backdrop-filter:blur(24px) saturate(150%); box-shadow:0 12px 38px #193d6426,0 1px 3px #193d6414; }
+      .header { display:flex; align-items:center; justify-content:space-between; gap:8px; }
+      strong { font-size:15px; font-weight:700; letter-spacing:.1px; }
+      .version { font-size:11px; color:#63758d; font-variant-numeric:tabular-nums; }
+      p { margin:10px 0 14px; }
+      .status { font-size:13px; line-height:1.65; color:#495d78; white-space:pre-line; overflow-wrap:anywhere; }
+      button,a { cursor:pointer; border:1px solid #cfdae8; border-radius:9px; background:#fff;
+        color:#244666; padding:8px 12px; text-decoration:none; display:inline-block; }
+      button:hover,a:hover { background:#eff5fc; } button:disabled { opacity:.55; cursor:wait; }
+      button:focus-visible,a:focus-visible { outline:3px solid #6aa2e6; outline-offset:3px; }
+      .controls { display:flex; gap:8px; }
+      .check { flex:1; background:#285eaa; border-color:#285eaa; color:white; font-weight:600; }
+      .check:hover { background:#204e90; }
+      .settings { background:rgba(255,255,255,.55); }
+      .footer { display:flex; align-items:center; justify-content:space-between; gap:4px; margin-top:12px;
+        border-top:1px solid #dbe3ee; padding-top:10px; color:#63758d; font-size:11px; }
+      .reset { background:transparent; border:0; padding:3px 0 3px 10px; border-radius:4px; color:#4a6384; font-size:11px; }
       dialog { color:#243047; font:14px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
         width:min(660px,92vw); max-height:85vh; overflow:auto; padding:24px;
         border:1px solid #cfd9e5; border-radius:14px; box-shadow:0 24px 90px #0004; }
@@ -331,38 +475,76 @@
       .actions { display:flex; justify-content:flex-end; gap:10px; margin-top:20px; }
       .primary { background:#2459aa; border-color:#2459aa; color:#fff; }
       .primary:hover { background:#1b4584; }
+      @keyframes oa-breathe { 50% { opacity:.35; } }
+      @media (prefers-reduced-motion:reduce) { .orb,.popover { transition:none; } .orb::after { animation:none !important; } }
+      @media (prefers-reduced-transparency:reduce) { .orb,.card { background:#f7faff; backdrop-filter:none; } }
     `, root);
     const panel = element('section', undefined, root);
     panel.className = 'panel';
-    const heading = element('strong', `OA 补卡提醒 · v${SCRIPT_VERSION}`, panel);
-    const status = element('p', `北京时间 ${CHECK_LABEL} · 检查前三个自然日`, panel);
+    const orb = element('button', 'OA', panel);
+    orb.type = 'button';
+    orb.className = 'orb';
+    orb.setAttribute('aria-describedby', 'oa-widget-status');
+    const popover = element('div', undefined, panel);
+    popover.className = 'popover';
+    const card = element('div', undefined, popover);
+    card.className = 'card';
+    const header = element('div', undefined, card);
+    header.className = 'header';
+    const heading = element('strong', 'OA 考勤检查', header);
+    element('span', `v${SCRIPT_VERSION}`, header).className = 'version';
+    const status = element('p', '', card);
     status.className = 'status';
+    status.id = 'oa-widget-status';
     status.setAttribute('role', 'status');
-    const check = button('立即检查', () => requestCheck(), panel);
-    ui = { root, panel, heading, status, check };
+    const controls = element('div', undefined, card);
+    controls.className = 'controls';
+    const check = button('立即检查', () => requestCheck(), controls);
+    check.className = 'check';
+    const settingsButton = button('设置', configure, controls);
+    settingsButton.className = 'settings';
+    const footer = element('div', undefined, card);
+    footer.className = 'footer';
+    element('span', '拖动移动 · Alt + 方向键微调', footer);
+    const reset = element('button', '复位', footer);
+    reset.type = 'button';
+    reset.className = 'reset';
+    reset.setAttribute('aria-label', '恢复右下角位置');
+    ui = { root, panel, orb, popover, card, heading, status, check, settings: settingsButton, reset };
+    setupWidget(ui);
     return ui;
   }
 
   function showUI(launcher = false) {
     const view = createUI();
+    const login = isOALogin(location.href);
+    const busy = opening || running || loginRunning;
     view.panel.hidden = false;
-    view.panel.className = launcher ? 'panel launcher' : 'panel';
-    view.heading.hidden = launcher;
-    view.status.hidden = launcher;
-    view.check.hidden = !launcher && isOALogin(location.href);
-    view.check.disabled = configDirty || (launcher ? opening : running);
-    view.check.textContent = configDirty ? '设置已保存，请刷新网页' : !settings ? '配置 OA 考勤'
-      : launcher ? (opening ? '正在打开 OA…' : 'OA 考勤检查') : '立即检查';
+    view.check.hidden = !launcher && login;
+    view.check.disabled = configDirty || busy;
+    view.settings.disabled = busy;
+    view.check.textContent = configDirty ? '刷新网页后使用' : !settings ? '配置 OA 考勤'
+      : opening ? '正在打开 OA…' : running ? '检查中…' : '立即检查';
     view.check.title = `${launcher ? '在新标签页打开 OA，立即检查最近三天考勤' : '立即检查最近三天考勤'} · v${SCRIPT_VERSION}`;
+    view.orb.setAttribute('aria-label', !settings ? '配置 OA 考勤' : login ? 'OA 登录状态，可拖动调整位置'
+      : 'OA 考勤检查，点击检查，可拖动调整位置');
+    view.orb.setAttribute('aria-busy', String(busy));
+    view.orb.setAttribute('aria-disabled', String(view.check.disabled || view.check.hidden));
+    view.orb.setAttribute('data-state', !settings || configDirty ? 'setup'
+      : get('completedDay') === beijingTime().day ? 'done' : 'ready');
+    view.status.textContent = configDirty ? '本机设置已保存。\n请刷新已打开的网页后使用。'
+      : !settings ? '先配置本机 OA 信息。\n站点和时间设置仅保存在当前浏览器。'
+      : opening ? '正在新标签页打开 OA…'
+      : !launcher && lastStatus ? lastStatus
+      : get('completedDay') === beijingTime().day ? '今天已完成自动检查。\n可随时点击，重新检查前三天。'
+      : `每天 ${CHECK_LABEL} · 北京时间\n检查前三个完整自然日，异常时提醒。`;
+    view.place();
     return view;
   }
 
   function status(text) {
     lastStatus = text;
-    if (!document.body) return;
-    const view = showUI();
-    view.status.textContent = text;
-    view.check.disabled = running;
+    if (document.body) showUI();
   }
 
   function showDialog(title, description, rows = [], apply = false) {
@@ -545,7 +727,7 @@
       clearTimeout(deadlineTimer);
       if (control.token) releaseLock(control.token);
       running = false;
-      if (ui) ui.check.disabled = false;
+      if (ui) showUI(!onRecordPage() && !isOALogin(location.href));
     }
   }
 
@@ -626,6 +808,7 @@
     } finally {
       if (lockToken) releaseLock(lockToken);
       loginRunning = false;
+      if (ui) showUI();
     }
   }
 

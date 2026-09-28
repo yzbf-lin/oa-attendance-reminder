@@ -5,6 +5,7 @@ const vm = require('node:vm');
 const core = require('../oa-attendance-reminder.user.js');
 const source = fs.readFileSync(require.resolve('../oa-attendance-reminder.user.js'), 'utf8');
 const SETTINGS_KEY = 'oa-attendance-v1:settings';
+const POSITION_KEY = 'oa-attendance-v1:widgetPosition';
 // 保留域名和字段均为虚构测试数据；实际部署地址只从用户本地配置读取。
 const EXAMPLE_SETTINGS = {
   recordUrl: 'http://oa.example/oa.html/attendance/record',
@@ -84,16 +85,72 @@ test('只辅助可信 SSO 返回 OA 的登录，不接受相似域名或其他�
 
 // 运行真实 userscript 的浏览器最小模型：原生 OA 查询为桩，虚拟时钟覆盖导航和竞争。
 class Node {
-  constructor(tag) { this.tagName = tag; this.children = []; this.textContent = ''; this.listeners = {}; }
-  append(node) { this.children.push(node); }
-  attachShadow() { this.shadow = new Node('shadow'); return this.shadow; }
-  addEventListener(name, fn) { this.listeners[name] = fn; }
-  setAttribute() {}
+  constructor(tag) {
+    this.tagName = tag; this.children = []; this.textContent = ''; this.listeners = {};
+    this.attributes = new Map(); this.className = ''; this.dataset = {}; this.hidden = false; this.disabled = false;
+    this.pointerCaptures = new Set();
+    this.style = {
+      setProperty(name, value) { this[name] = String(value); },
+      getPropertyValue(name) { return this[name] ?? ''; },
+      removeProperty(name) { const value = this[name]; delete this[name]; return value ?? ''; },
+    };
+    this.classList = {
+      contains: (name) => this.className.split(/\s+/).includes(name),
+      add: (...names) => { this.className = [...new Set([...this.className.split(/\s+/).filter(Boolean), ...names])].join(' '); },
+      remove: (...names) => { this.className = this.className.split(/\s+/).filter((name) => !names.includes(name)).join(' '); },
+      toggle: (name, force) => {
+        const add = force ?? !this.classList.contains(name);
+        if (add) this.classList.add(name); else this.classList.remove(name);
+        return add;
+      },
+    };
+  }
+  append(node) { this.children.push(node); node.parentNode = this; }
+  appendChild(node) { this.append(node); return node; }
+  attachShadow() { this.shadow = new Node('shadow'); this.shadow.host = this; return this.shadow; }
+  addEventListener(name, fn) {
+    const previous = this.listeners[name];
+    this.listeners[name] = (event) => {
+      previous?.(event);
+      if (!event?.immediatePropagationStopped) fn.call(this, event);
+    };
+  }
+  setAttribute(name, value) {
+    this.attributes.set(name, String(value));
+    if (name === 'class') this.className = String(value);
+    if (name === 'id') this.id = String(value);
+  }
+  getAttribute(name) { return this.attributes.get(name) ?? null; }
+  removeAttribute(name) { this.attributes.delete(name); }
+  hasAttribute(name) { return this.attributes.has(name); }
   showModal() { this.open = true; }
   close() { this.open = false; }
   remove() {}
   focus() {}
-  click() { if (!this.disabled && !this.hidden) this.listeners.click?.(); }
+  emit(type, init = {}) {
+    const event = {
+      type, target: this, currentTarget: this, defaultPrevented: false,
+      pointerId: 1, pointerType: 'mouse', isPrimary: true, button: 0, buttons: 1,
+      clientX: 0, clientY: 0, detail: 1, altKey: false, shiftKey: false,
+      preventDefault() { this.defaultPrevented = true; },
+      stopPropagation() { this.propagationStopped = true; },
+      stopImmediatePropagation() { this.immediatePropagationStopped = true; },
+      ...init,
+    };
+    this.listeners[type]?.(event);
+    return event;
+  }
+  click(init = {}) { if (!this.disabled && !this.hidden) return this.emit('click', init); }
+  setPointerCapture(id) { this.pointerCaptures.add(id); }
+  releasePointerCapture(id) { this.pointerCaptures.delete(id); }
+  hasPointerCapture(id) { return this.pointerCaptures.has(id); }
+  contains(node) { return this === node || this.children.some((child) => child.contains(node)) || Boolean(this.shadow?.contains(node)); }
+  getBoundingClientRect() {
+    const position = this.classList.contains('orb') ? this.parentNode : this;
+    const left = Number.parseFloat(position.style.left) || 0;
+    const top = Number.parseFloat(position.style.top) || 0;
+    return { x: left, y: top, left, top, right: left + 56, bottom: top + 56, width: 56, height: 56 };
+  }
   getClientRects() { return [{}]; }
 }
 
@@ -115,10 +172,12 @@ class Clock {
   }
 }
 
-function harness({ clock = new Clock(), store = new Map(), href = 'http://oa.example/oa.html/attendance/record', permission, query, data = rows(), openTab, online = true, privatePage = false, script = source, tabState = {}, readyState = 'complete', settings = EXAMPLE_SETTINGS, promptResponses = [], querySelectorError = null } = {}) {
+function harness({ clock = new Clock(), store = new Map(), href = 'http://oa.example/oa.html/attendance/record', permission, query, data = rows(), openTab, online = true, privatePage = false, script = source, tabState = {}, readyState = 'complete', settings = EXAMPLE_SETTINGS, promptResponses = [], querySelectorError = null, viewport = { width: 1280, height: 800 } } = {}) {
   if (settings !== null && !store.has(SETTINGS_KEY)) store.set(SETTINGS_KEY, structuredClone(settings));
   const stats = { queries: 0, logins: 0, navigation: [], opened: [], alerts: [], replaced: [], prompts: [] };
   const document = new Node('document'); document.body = new Node('body'); document.readyState = readyState;
+  document.documentElement = new Node('html');
+  document.documentElement.clientWidth = viewport.width; document.documentElement.clientHeight = viewport.height;
   document.createElement = (tag) => new Node(tag);
   const login = new Node('button'); login.click = () => stats.logins++;
   document.querySelector = (selector) => {
@@ -146,6 +205,7 @@ function harness({ clock = new Clock(), store = new Map(), href = 'http://oa.exa
     attendanceData: [{ date: 'old' }], total: 57,
   };
   const window = new Node('window'); window.self = window; window.top = window;
+  window.innerWidth = viewport.width; window.innerHeight = viewport.height;
   window.history = {
     state: { original: 'preserved' },
     replaceState(state, _, href) { this.state = state; url = new URL(href, url); stats.replaced.push(url.href); },
@@ -183,9 +243,18 @@ function harness({ clock = new Clock(), store = new Map(), href = 'http://oa.exa
   }
   vm.runInNewContext(script, sandbox);
   function all(node = document.body) { return [node, ...node.children.flatMap((child) => all(child)), ...(node.shadow ? all(node.shadow) : [])]; }
+  const byClass = (name) => all().find((node) => node.classList.contains(name));
   return { clock, store, stats, document, window, record, location, navigator, tabState, menus,
     manual: () => { assert.ok(menus.has('立即检查最近三天考勤')); return menus.get('立即检查最近三天考勤')(); },
     configure: () => { assert.ok(menus.has('配置 OA（仅保存在本机）')); return menus.get('配置 OA（仅保存在本机）')(); },
+    orb: () => byClass('orb'), check: () => byClass('check'), panel: () => byClass('panel'),
+    popover: () => byClass('popover'), settingsButton: () => byClass('settings'), reset: () => byClass('reset'),
+    position: () => ({ x: Number.parseFloat(byClass('panel').style.left), y: Number.parseFloat(byClass('panel').style.top) }),
+    resize: (width, height) => {
+      window.innerWidth = width; window.innerHeight = height;
+      document.documentElement.clientWidth = width; document.documentElement.clientHeight = height;
+      window.emit('resize');
+    },
     buttons: () => all().filter((n) => n.tagName === 'button'),
     dialogs: () => all().filter((n) => n.tagName === 'dialog' && n.open), text: () => all().map((n) => n.textContent).join('\n') };
 }
@@ -260,7 +329,8 @@ test('08:59 已在 SSO，9 点后辅助登录一次且无凭据读取', async ()
   const h = harness({ clock: new Clock('2026-09-26T00:59:00Z'), href: loginURL });
   await h.clock.advance(59000); assert.equal(h.stats.logins, 0);
   await h.clock.advance(6000); assert.equal(h.stats.logins, 1);
-  assert.equal(h.buttons()[0].hidden, true);
+  assert.equal(h.check().hidden, true);
+  assert.equal(h.orb().hidden, false);
   await h.clock.advance(3600000); assert.equal(h.stats.logins, 1);
 });
 
@@ -408,17 +478,19 @@ test('浏览器内部页面不运行调度，也不注册菜单', async () => {
 test('HTTP/HTTPS 其他域名显示悬浮入口，点击新开 OA 且不读取原网页内容', async () => {
   for (const href of ['https://example.com/private?secret=not-stored', 'http://another.example/']) {
     const h = harness({ clock: new Clock('2026-09-26T00:00:00Z'), href, privatePage: true });
-    const check = h.buttons().find((node) => node.textContent === 'OA 考勤检查');
+    const check = h.orb();
     assert.ok(check); assert.equal(check.hidden, false);
-    assert.match(check.title, /新标签页/);
+    assert.equal(check.textContent, 'OA');
     check.click(); check.click();
-    assert.equal(check.disabled, true);
+    assert.equal(check.getAttribute('aria-disabled'), 'true');
+    assert.equal(check.disabled, false);
+    assert.equal(h.check().disabled, true);
     await h.clock.advance(1000);
     assert.deepEqual(h.stats.opened, [{
       url: 'http://oa.example/oa.html/attendance/record#oa-attendance-check',
       options: { active: true, insert: true },
     }]);
-    assert.equal(check.disabled, false);
+    assert.equal(check.getAttribute('aria-disabled'), 'false');
     assert.equal(h.location.href, href); assert.equal(h.stats.navigation.length, 0);
     assert.equal(h.stats.queries, 0); assert.equal(h.dialogs().length, 0);
     assert.ok(!JSON.stringify([...h.store]).includes('not-stored'));
@@ -432,7 +504,7 @@ test('手动入口只在新标签检查；9 点前或当天已完成时，旧 OA
     const oldRecord = harness({ clock, store });
     const oldLogin = harness({ clock, store, href: loginURL });
     const web = harness({ clock, store, href: 'https://example.com/' });
-    web.buttons()[0].click(); await clock.advance(1000);
+    web.orb().click(); await clock.advance(1000);
     oldRecord.window.listeners.focus(); oldLogin.window.listeners.focus();
     await clock.advance(1000);
     assert.equal(oldRecord.stats.queries, 0); assert.equal(oldLogin.stats.logins, 0);
@@ -452,7 +524,7 @@ test('已有 OA 查询持锁也能新开，新标签保留手动意图并在解�
   } });
   old.manual(); await clock.advance(1000);
   const web = harness({ clock, store, href: 'https://example.com/' });
-  web.buttons()[0].click(); await clock.advance(1000);
+  web.orb().click(); await clock.advance(1000);
   assert.equal(web.stats.opened.length, 1);
   const opened = harness({ clock, store, href: web.stats.opened[0].url });
   await clock.advance(1000);
@@ -464,9 +536,9 @@ test('已有 OA 查询持锁也能新开，新标签保留手动意图并在解�
 
 test('入口开页失败会提示且恢复按钮，可以再次点击', async () => {
   const h = harness({ clock: new Clock('2026-09-26T00:00:00Z'), href: 'https://example.com/', openTab: () => null });
-  const check = h.buttons()[0];
+  const check = h.orb();
   check.click(); await h.clock.advance(1000);
-  assert.equal(h.stats.alerts.length, 1); assert.equal(check.disabled, false);
+  assert.equal(h.stats.alerts.length, 1); assert.equal(check.getAttribute('aria-disabled'), 'false');
   assert.equal(h.store.has('oa-attendance-v1:completedDay'), false);
   check.click(); await h.clock.advance(1000);
   assert.equal(h.stats.opened.length, 2);
@@ -520,7 +592,7 @@ test('无关网页和非 OA 登录不消费手动标记，也不接受旧共享�
 test('9 点前从其他域名手动检查并关闭 OA，不占用 9 点自动开页', async () => {
   const clock = new Clock('2026-09-26T00:00:00Z'); const store = new Map();
   const web = harness({ clock, store, href: 'https://example.com/' });
-  web.buttons()[0].click(); await clock.advance(1000);
+  web.orb().click(); await clock.advance(1000);
   const webJobs = new Set(clock.jobs.keys());
   const opened = harness({ clock, store, href: web.stats.opened[0].url });
   await clock.advance(1000); assert.equal(opened.stats.queries, 1);
@@ -726,8 +798,9 @@ test('发布元数据与完整脚本头一致，版本和公开更新地址对�
   assert.equal(meta, header);
   const fields = Object.fromEntries([...header.matchAll(/^\/\/\s+@(namespace|version|homepageURL|updateURL|downloadURL)\s+(.+)$/gm)]
     .map((match) => [match[1], match[2]]));
-  assert.equal(fields.version, '1.3.0');
-  assert.match(source, /const SCRIPT_VERSION = '1\.3\.0';/);
+  const scriptVersion = source.match(/const SCRIPT_VERSION = '([^']+)';/)?.[1];
+  assert.match(scriptVersion, /^\d+\.\d+\.\d+$/);
+  assert.equal(fields.version, scriptVersion);
   const repository = new URL(fields.namespace);
   assert.equal(repository.protocol, 'https:');
   assert.equal(repository.hostname, 'github.com');
@@ -759,5 +832,171 @@ test('无效登录按钮 CSS 选择器给出可修正提示，不点击登录也
   assert.equal(h.store.has('oa-attendance-v1:loginAttemptDay'), false);
   await h.clock.advance(30000);
   assert.equal(h.stats.logins, 0);
+  assert.equal(h.stats.queries, 0);
+});
+
+function dragWidget(h, dx, dy, end = 'pointerup') {
+  const start = h.position();
+  const point = { clientX: start.x + 28, clientY: start.y + 28 };
+  h.orb().emit('pointerdown', point);
+  h.orb().emit('pointermove', { clientX: point.clientX + dx, clientY: point.clientY + dy });
+  h.orb().emit(end, { clientX: point.clientX + dx, clientY: point.clientY + dy, buttons: 0 });
+}
+
+function tapWidget(h) {
+  const position = h.position();
+  const point = { clientX: position.x + 28, clientY: position.y + 28 };
+  h.orb().emit('pointerdown', point);
+  h.orb().emit('pointerup', { ...point, buttons: 0 });
+  h.orb().click();
+}
+
+test('拖动普通网页入口不查询或开页，抑制拖动后的 click，下一次正常点击仍有效', async () => {
+  const h = harness({ clock: new Clock('2026-09-26T00:00:00Z'),
+    href: 'https://example.com/private?value=not-stored', privatePage: true });
+  assert.deepEqual(h.position(), { x: 1204, y: 724 });
+  dragWidget(h, -204, -224);
+  assert.ok(Math.abs(h.position().x - 1000) < 1e-8);
+  assert.ok(Math.abs(h.position().y - 500) < 1e-8);
+  h.orb().click(); await h.clock.advance(1000);
+  assert.equal(h.stats.opened.length, 0);
+  assert.equal(h.stats.queries, 0);
+  assert.equal(h.stats.logins, 0);
+  const saved = h.store.get(POSITION_KEY);
+  assert.deepEqual(Object.keys(saved).sort(), ['x', 'y']);
+  assert.ok(saved.x > 0 && saved.x < 1 && saved.y > 0 && saved.y < 1);
+  assert.ok(!JSON.stringify(saved).includes('not-stored'));
+  assert.equal(h.orb().hasPointerCapture(1), false);
+  tapWidget(h); await h.clock.advance(1000);
+  assert.equal(h.stats.opened.length, 1);
+  assert.match(h.stats.opened[0].url, /#oa-attendance-check$/);
+});
+
+test('归一化位置跨网页恢复，复位按钮清除记忆并回到右下角', async () => {
+  const store = new Map([[POSITION_KEY, { x: 0.25, y: 0.75 }]]);
+  const clock = new Clock('2026-09-26T00:00:00Z');
+  const first = harness({ clock, store, href: 'https://first.example/' });
+  assert.deepEqual(first.position(), { x: 316, y: 548 });
+  dragWidget(first, 120, -80);
+  const saved = structuredClone(store.get(POSITION_KEY));
+  const next = harness({ clock, store, href: 'https://second.example/', privatePage: true });
+  assert.deepEqual(next.position(), first.position());
+  assert.deepEqual(store.get(POSITION_KEY), saved);
+  next.reset().click();
+  assert.equal(store.has(POSITION_KEY), false);
+  assert.deepEqual(next.position(), { x: 1204, y: 724 });
+  await clock.advance(1000);
+  assert.equal(next.stats.opened.length, 0);
+});
+
+test('拖动限制在视口内，resize 使用相对位置且极小视口不会产生 NaN', async () => {
+  const h = harness({ clock: new Clock('2026-09-26T00:00:00Z'), href: 'https://example.com/' });
+  dragWidget(h, -10000, -10000);
+  assert.deepEqual(h.position(), { x: 20, y: 20 });
+  assert.deepEqual(h.store.get(POSITION_KEY), { x: 0, y: 0 });
+  dragWidget(h, 10000, 10000);
+  assert.deepEqual(h.position(), { x: 1204, y: 724 });
+  assert.deepEqual(h.store.get(POSITION_KEY), { x: 1, y: 1 });
+  h.resize(320, 240); await h.clock.advance(50);
+  assert.deepEqual(h.position(), { x: 244, y: 164 });
+  h.resize(80, 72); await h.clock.advance(50);
+  assert.deepEqual(h.position(), { x: 12, y: 8 });
+  h.resize(1280, 800); await h.clock.advance(50);
+  assert.deepEqual(h.position(), { x: 1204, y: 724 });
+  assert.equal(h.stats.opened.length, 0);
+});
+
+test('pointercancel 和捕获丢失撤销拖动，不保存临时位置，也不触发检查', async () => {
+  for (const end of ['pointercancel', 'lostpointercapture']) {
+    const store = new Map([[POSITION_KEY, { x: 0.25, y: 0.75 }]]);
+    const h = harness({ clock: new Clock('2026-09-26T00:00:00Z'), store, href: 'https://example.com/' });
+    const original = h.position();
+    dragWidget(h, 100, -100, end);
+    await h.clock.advance(1000);
+    assert.deepEqual(h.position(), original, end);
+    assert.deepEqual(store.get(POSITION_KEY), { x: 0.25, y: 0.75 }, end);
+    assert.equal(h.stats.opened.length, 0, end);
+    assert.equal(h.stats.queries, 0, end);
+    tapWidget(h); await h.clock.advance(1000);
+    assert.equal(h.stats.opened.length, 1, end);
+  }
+});
+
+test('小于拖动阈值的指针移动仍按普通点击处理，不写位置记忆', async () => {
+  const h = harness({ clock: new Clock('2026-09-26T00:00:00Z'), href: 'https://example.com/' });
+  dragWidget(h, -3, -4);
+  h.orb().click(); await h.clock.advance(1000);
+  assert.equal(h.stats.opened.length, 1);
+  assert.equal(h.store.has(POSITION_KEY), false);
+  assert.deepEqual(h.position(), { x: 1204, y: 724 });
+});
+
+test('正在查询时 orb 保持可拖动，点击不会重复查询，主按钮仍禁用', async () => {
+  let resolve;
+  const h = harness({ clock: new Clock('2026-09-26T00:00:00Z'), permission() {
+    return new Promise((done) => { resolve = () => { this.query.userIds = [42]; done(); }; });
+  } });
+  h.manual(); await h.clock.advance(1000);
+  assert.equal(h.orb().disabled, false);
+  assert.equal(h.orb().getAttribute('aria-disabled'), 'true');
+  assert.equal(h.check().disabled, true);
+  dragWidget(h, -100, -100);
+  assert.deepEqual(h.position(), { x: 1104, y: 624 });
+  h.orb().click(); tapWidget(h);
+  await h.clock.advance(1000);
+  assert.equal(h.stats.opened.length, 0);
+  assert.equal(h.stats.queries, 0);
+  resolve(); await h.clock.advance(1000);
+  assert.equal(h.stats.queries, 1);
+  assert.equal(h.orb().getAttribute('aria-disabled'), 'false');
+});
+
+test('SSO 页面隐藏查询按钮但保留可拖动的 orb，不因拖动再开 OA 或重复登录', async () => {
+  const h = harness({ href: loginURL });
+  await h.clock.advance(4000);
+  assert.equal(h.stats.logins, 1);
+  assert.equal(h.check().hidden, true);
+  assert.equal(h.orb().hidden, false);
+  assert.equal(h.orb().disabled, false);
+  dragWidget(h, -100, -100);
+  h.orb().click(); await h.clock.advance(1000);
+  assert.deepEqual(h.position(), { x: 1104, y: 624 });
+  assert.equal(h.stats.opened.length, 0);
+  assert.equal(h.stats.logins, 1);
+});
+
+test('Alt 方向键移动 10px，Shift 加速为 40px，普通方向键不改位置', () => {
+  const h = harness({ clock: new Clock('2026-09-26T00:00:00Z'), href: 'https://example.com/' });
+  const moved = h.orb().emit('keydown', { key: 'ArrowLeft', altKey: true });
+  assert.equal(moved.defaultPrevented, true);
+  assert.deepEqual(h.position(), { x: 1194, y: 724 });
+  h.orb().emit('keydown', { key: 'ArrowUp', altKey: true, shiftKey: true });
+  assert.deepEqual(h.position(), { x: 1194, y: 684 });
+  h.orb().emit('keydown', { key: 'ArrowRight' });
+  assert.deepEqual(h.position(), { x: 1194, y: 684 });
+  assert.ok(h.store.get(POSITION_KEY).x < 1);
+  assert.equal(h.stats.opened.length, 0);
+});
+
+test('信息层的设置入口调用本地配置交互，不打开 OA', async () => {
+  const h = harness({ clock: new Clock('2026-09-26T00:00:00Z'), href: 'https://example.com/', promptResponses: [null] });
+  h.settingsButton().click(); await h.clock.advance(1000);
+  assert.equal(h.stats.prompts.length, 1);
+  assert.equal(h.stats.opened.length, 0);
+  assert.deepEqual(h.store.get(SETTINGS_KEY), EXAMPLE_SETTINGS);
+});
+
+test('Escape 关闭信息卡并保持关闭，重新进入组件后可以再次展开', async () => {
+  const h = harness({ clock: new Clock('2026-09-26T00:00:00Z'), href: 'https://example.com/' });
+  h.panel().emit('pointerenter');
+  assert.equal(h.panel().getAttribute('data-dismissed'), 'false');
+  const dismissed = h.panel().emit('keydown', { key: 'Escape' });
+  assert.equal(dismissed.defaultPrevented, true);
+  assert.equal(h.panel().getAttribute('data-dismissed'), 'true');
+  await h.clock.advance(1000);
+  assert.equal(h.panel().getAttribute('data-dismissed'), 'true');
+  h.panel().emit('pointerenter');
+  assert.equal(h.panel().getAttribute('data-dismissed'), 'false');
+  assert.equal(h.stats.opened.length, 0);
   assert.equal(h.stats.queries, 0);
 });

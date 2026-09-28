@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OA 最近三天补卡提醒
 // @namespace    https://github.com/yzbf-lin/oa-attendance-reminder
-// @version      1.3.0
+// @version      1.4.0
 // @homepageURL  https://github.com/yzbf-lin/oa-attendance-reminder
 // @updateURL    https://raw.githubusercontent.com/yzbf-lin/oa-attendance-reminder/main/oa-attendance-reminder.meta.js
 // @downloadURL  https://raw.githubusercontent.com/yzbf-lin/oa-attendance-reminder/main/oa-attendance-reminder.user.js
